@@ -132,6 +132,14 @@ match_handler(Path, [Handler = #{prefix := Prefix} | Handlers]) ->
 add_slash("/" ++ _ = Path) -> Path;
 add_slash(Path) -> "/" ++ Path.
 
+apply_handler(Req, Path, #{mfargs := MFArgs, options := #{authorization := {Mod, Fun}}}) ->
+    case erlang:apply(Mod, Fun, [Req]) of
+        true  -> apply_handler(Req, Path, MFArgs);
+        false ->
+            cowboy_req:reply(401, #{<<"WWW-Authenticate">> => <<"Basic Realm=\"minirest-server\"">>},
+                             <<"UNAUTHORIZED">>, Req)
+    end;
+
 apply_handler(Req, Path, #{mfargs := MFArgs, options := #{authorization := AuthFun}}) ->
     case AuthFun(Req) of
         true  -> apply_handler(Req, Path, MFArgs);
@@ -170,60 +178,25 @@ return(ok) ->
     {ok, #{code => ?SUCCESS}};
 return({ok, #{data := Data, meta := Meta}}) ->
     {ok, #{code => ?SUCCESS,
-           data => to_map(Data),
-           meta => to_map(Meta)}};
+           data => Data,
+           meta => Meta}};
 return({ok, Data}) ->
     {ok, #{code => ?SUCCESS,
-           data => to_map(Data)}};
+           data => Data}};
 return({ok, Code, Message}) when is_integer(Code) ->
     {ok, #{code => Code,
            message => format_msg(Message)}};
 return({ok, Data, Meta}) ->
     {ok, #{code => ?SUCCESS,
-           data => to_map(Data),
-           meta => to_map(Meta)}};
+           data => Data,
+           meta => Meta}};
 return({error, Message}) ->
     {ok, #{message => format_msg(Message)}};
 return({error, Code, Message}) ->
     {ok, #{code => Code,
            message => format_msg(Message)}}.
 
-%% [{a, b}]           => #{a => b}
-%% [[{a,b}], [{c,d}]] => [#{a => b}, #{c => d}]
-%%
-%% [{a, #{b => c}}]   => #{a => #{b => c}}
-%% #{a => [{b, c}]}   => #{a => #{b => c}}
-
-to_map([[{_,_}|_]|_] = L) ->
-    [to_map(E) || E <- L];
-to_map([{_, _}|_] = L) ->
-    lists:foldl(
-      fun({Name, Value}, Acc) ->
-        Acc#{Name => to_map(Value)}
-      end, #{}, L);
-to_map([M|_] = L) when is_map(M) ->
-    [to_map(E) || E <- L];
-to_map(M) when is_map(M) ->
-    maps:map(fun(_, V) -> to_map(V) end, M);
-to_map(T) -> T.
-
+format_msg(Message) when is_binary(Message) ->
+    Message;
 format_msg(Message) ->
-    try unicode:characters_to_binary(Message)
-    catch error : badarg -> iolist_to_binary(io_lib:format("~0p", [Message]))
-    end.
-
-%%====================================================================
-%% EUnits
-%%====================================================================
-
--ifdef(TEST).
-
--include_lib("eunit/include/eunit.hrl").
-
-to_map_test() ->
-    #{a := b} = to_map([{a, b}]),
-    [#{a := b, c := d}, #{e := f}] = to_map([[{a, b}, {c, d}], [{e, f}]]),
-    #{a := #{b := c}} = to_map([{a, #{b => c}}]),
-    #{a := #{b := c}} = to_map(#{a => [{b, c}]}).
-
--endif.
+    iolist_to_binary(io_lib:format("~0p", [Message])).

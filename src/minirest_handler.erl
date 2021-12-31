@@ -69,6 +69,12 @@ dispatch(Path, Req, Routes, Filter) ->
 dispatch(Req, Route, undefined) ->
     dispatch(Req, Route);
 
+dispatch(Req, Route, {Mod, Fun}) ->
+    case erlang:apply(Mod, Fun, [Route]) of
+        true -> dispatch(Req, Route);
+        false -> reply(404, <<"Not found.">>, Req)
+    end;
+
 dispatch(Req, Route, Filter) ->
     case Filter(Route) of
         true -> dispatch(Req, Route);
@@ -169,7 +175,7 @@ reply(Code, Text, Req) ->
 
 %% JSON
 json_encode(D) ->
-    to_binary(jiffy:encode(D, [force_utf8])).
+    to_binary(jiffy:encode(to_map(D), [force_utf8])).
 
 to_binary(B) when is_binary(B) -> B;
 to_binary(L) when is_list(L) ->
@@ -186,3 +192,42 @@ from_ejson({[]}) ->
 from_ejson({L}) ->
     [{Name, from_ejson(Value)} || {Name, Value} <- L];
 from_ejson(T) -> T.
+
+%% [{a, b}]           => #{a => b}
+%% [[{a,b}], [{c,d}]] => [#{a => b}, #{c => d}]
+%%
+%% [{a, #{b => c}}]   => #{a => #{b => c}}
+%% #{a => [{b, c}]}   => #{a => #{b => c}}
+%% #{a => [{}]}       => #{a => #{}}
+
+to_map([{}]) ->
+    #{};
+to_map([[{_,_}|_]|_] = L) ->
+    [to_map(E) || E <- L];
+to_map([{_, _}|_] = L) ->
+    lists:foldl(
+      fun({Name, Value}, Acc) ->
+        Acc#{Name => to_map(Value)}
+      end, #{}, L);
+to_map([M|_] = L) when is_map(M) ->
+    [to_map(E) || E <- L];
+to_map(M) when is_map(M) ->
+    maps:map(fun(_, V) -> to_map(V) end, M);
+to_map(T) -> T.
+
+%%====================================================================
+%% EUnits
+%%====================================================================
+
+-ifdef(TEST).
+
+-include_lib("eunit/include/eunit.hrl").
+
+to_map_test() ->
+    #{a := b} = to_map([{a, b}]),
+    [#{a := b, c := d}, #{e := f}] = to_map([[{a, b}, {c, d}], [{e, f}]]),
+    #{a := #{b := c}} = to_map([{a, #{b => c}}]),
+    #{a := #{b := c}} = to_map(#{a => [{b, c}]}),
+    #{a := #{}} = to_map(#{a => [{}]}).
+
+-endif.
