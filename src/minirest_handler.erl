@@ -1,4 +1,4 @@
-%% Copyright (c) 2013-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2013-2019 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -14,160 +14,220 @@
 
 -module(minirest_handler).
 
--export([init/2]).
+-export([ init/1
+        , dispatch/4
+        ]).
 
--include("minirest_http.hrl").
+-type(config() :: #{apps => [atom()], modules => [module()], except => [atom()], filter => fun() }).
 
--include("minirest.hrl").
+-export_type([config/0]).
 
-%%==============================================================================================
-%% cowboy callback init
-init(Request0, State)->
-    Request =
-        case handle(Request0, State) of
-            {error, {StatusCode, Headers, Body}} ->
-                cowboy_req:reply(StatusCode, Headers, Body, Request0);
-            {ok, Response, Handler} ->
-                reply(Response, Request0, Handler)
-        end,
-    {ok, Request, State}.
+-define(LOG(Level, Format, Args), logger:Level("Minirest(Handler): " ++ Format, Args)).
 
-%%%==============================================================================================
-%% internal
-handle(Request, State) ->
-    Method = cowboy_req:method(Request),
-    case maps:find(Method, State) of
-        error ->
-            Headers = allow_method_header(maps:keys(State)),
-            {error, {?RESPONSE_CODE_METHOD_NOT_ALLOWED, Headers, <<"">>}};
-        {ok, Handler} ->
-            {ok, do_auth(Request, Handler), Handler}
-    end.
+-spec(init(config()) -> {?MODULE, dispatch, list()}).
+init(Config) ->
+    Routes = lists:map(fun(App) ->
+        {ok, Modules} = application:get_key(App, modules),
+        routes(App, Config, Modules)
+    end, maps:get(apps, Config, [])),
+    {?MODULE, dispatch, [lists:flatten([Routes, routes(Config)]), maps:get(filter, Config, undefined)]}.
 
-allow_method_header(Allow) ->
-    #{<<"allow">> => trans_allow(Allow, <<"">>)}.
+routes(Config) ->
+    routes(undefined, Config, maps:get(modules, Config, [])).
 
-trans_allow([], Res) -> Res;
-trans_allow([Method], Res) -> <<Res/binary, Method/binary>>;
-trans_allow([Method | Allow], Res) ->
-    trans_allow(Allow, <<Res/binary, Method/binary, ", ">>).
+routes(App, Config, Modules) ->
+    lists:map(fun(Module) ->
+        [API#{module  => Module,
+              pattern => string:tokens(Path, "/"),
+              app     => App}
+         || {rest_api, [API = #{path := Path,
+                                name := Name}]} <- Module:module_info(attributes),
+                                                   not lists:member(Name, maps:get(except, Config, []))]
+    end, Modules).
 
-do_auth(Request, Handler = #handler{authorization = {M, F}}) ->
-    case erlang:apply(M, F, [Request]) of
-        ok ->
-            do_parse_params(Request, Handler);
-        Response when is_tuple(Response) ->
-            Response;
+%% Get API List
+dispatch("/", Req, Routes, _Filter) ->
+    case binary_to_atom(cowboy_req:method(Req), utf8) of
+        'GET' ->
+            jsonify(200, #{code => 0, data => [format_route(Route) || Route <- Routes]}, Req);
         _ ->
-            {?RESPONSE_CODE_UNAUTHORIZED}
+            reply(400, <<"Bad Request">>, Req)
     end;
 
-do_auth(Request, Handler) ->
-    do_parse_params(Request, Handler).
-
-do_parse_params(Request, Handler) ->
-    Params = #{
-        bindings => cowboy_req:bindings(Request),
-        query_string => maps:from_list(cowboy_req:parse_qs(Request)),
-        headers => cowboy_req:headers(Request),
-        body => #{}
-    },
-    do_read_body(Request, Params, Handler).
-
-do_read_body(Request, Params, Handler) ->
-    case cowboy_req:has_body(Request) of
-        true ->
-            case minirest_body:parse(Request) of
-                {ok, Body, NRequest} ->
-                    do_filter(NRequest, Params#{body => Body}, Handler);
-                {response, Response} ->
-                    Response
-            end;
+%% Dispatch request to REST APIs
+dispatch(Path, Req, Routes, Filter) ->
+    try match_route(binary_to_atom(cowboy_req:method(Req), utf8), Path, Routes) of
+        {ok, Route} ->
+            dispatch(Req, Route, Filter);
         false ->
-            do_filter(Request, Params, Handler)
+            reply(404, <<"Not found.">>, Req)
+    catch
+        _Error:_Reason ->
+            reply(404, <<"Not found.">>, Req)
     end.
 
-do_filter(Request, Params, #handler{filter = Filter,
-                                    path = Path,
-                                    module = Mod,
-                                    method = Method} = Handler) when is_function(Filter, 2) ->
-    case Filter(Params, #{path => Path, module => Mod, method => Method}) of
-        {ok, NewParams} ->
-            apply_callback(Request, NewParams, Handler);
-        Response ->
-            Response
-    end;
-do_filter(Request, Params, Handler) ->
-    apply_callback(Request, Params, Handler).
+dispatch(Req, Route, undefined) ->
+    dispatch(Req, Route);
 
-apply_callback(Request, Params, Handler) ->
-    #handler{path = Path, method = Method, module = Mod, function = Fun} = Handler,
-    try
-        Args =
-            case erlang:function_exported(Mod, Fun, 3) of
-                true -> [Method, Params, Request];
-                false -> [Method, Params]
-            end,
-        erlang:apply(Mod, Fun, Args)
-    catch E:R:S ->
-        ?LOG(warning, #{path => Path,
-                        exception => E,
-                        reason => R,
-                        stacktrace => S}),
-        Message = list_to_binary(io_lib:format("~p, ~0p, ~0p", [E, R, S], [])),
-        {?RESPONSE_CODE_INTERNAL_SERVER_ERROR, 'INTERNAL_ERROR', Message}
+dispatch(Req, Route, {Mod, Fun}) ->
+    case erlang:apply(Mod, Fun, [Route]) of
+        true -> dispatch(Req, Route);
+        false -> reply(404, <<"Not found.">>, Req)
+    end;
+
+dispatch(Req, Route, Filter) ->
+    case Filter(Route) of
+        true -> dispatch(Req, Route);
+        false -> reply(404, <<"Not found.">>, Req)
     end.
 
-%% response error
-reply({ErrorStatus, #{code := Code, message := Message}}, Req, Handler)
-  when (ErrorStatus < 200 orelse 300 =< ErrorStatus)
-  andalso is_atom(Code) ->
-    reply({ErrorStatus, Code, Message}, Req, Handler);
-reply({ErrorStatus, Code, Message}, Req, Handler = #handler{error_codes = Codes})
-  when (ErrorStatus < 200 orelse 300 =< ErrorStatus)
-  andalso is_atom(Code) ->
-    case maybe_ignore_code_check(ErrorStatus, Code) orelse lists:member(Code, Codes) of
-        true ->
-            ErrorMessageStruct = {message, #{code => Code, message => Message}},
-            {ok, Headers, Body} = minirest_body:encode(ErrorMessageStruct),
-            reply({ErrorStatus, Headers, Body}, Req, Handler);
+dispatch(Req, #{module := Mod, func := Fun, bindings := Bindings}) ->
+    case catch parse_params(Req) of
+        {'EXIT', Reason} ->
+            error_logger:error_msg("Params error: ~p", [Reason]),
+            reply(400, <<"Bad Request">>, Req);
+        Params ->
+            case erlang:apply(Mod, Fun, [Bindings, Params]) of
+                {file, Headers, {sendfile, _, _, _} = SendFile} ->
+                    cowboy_req:reply(200, Headers, SendFile, Req);
+                Return -> jsonify(Return, Req)
+            end
+    end.
+
+format_route(#{name := Name, method := Method, path := Path, descr := Descr}) ->
+    #{name => Name, method => Method, path => format_path(Path), descr => iolist_to_binary(Descr)}.
+
+%% Remove the :type field.
+format_path(Path) ->
+    re:replace(Path, <<":[^:]+(:[^/]+)">>, <<"\\1">>, [global, {return, binary}]).
+
+match_route(_Method, _Path, []) ->
+    false;
+match_route(Method, Path, [Route|Routes]) ->
+    case match_route(Method, Path, Route) of
+        {ok, Bindings} ->
+            {ok, Route#{bindings => Bindings}};
         false ->
-            NewMessage =
-                list_to_binary(
-                    io_lib:format(
-                        "not support code ~p, message ~p, schema def ~p", [Code, Message, Codes])),
-            reply({500, NewMessage}, Req, Handler)
+            match_route(Method, Path, Routes)
     end;
+match_route(Method, Path, #{method := Method, pattern := Pattern}) ->
+    match_path(string:tokens(Path, "/"), Pattern, #{});
+match_route(_Method, _Path, _Route) ->
+    false.
 
-%% response simple
-reply(StatusCode, Req, _Handler) when is_integer(StatusCode) ->
-    cowboy_req:reply(StatusCode, Req);
+match_path([], [], Bindings) ->
+    {ok, Bindings};
+match_path([], [_H|_T], _) ->
+    false;
+match_path([_H|_T], [], _) ->
+    false;
+match_path([H1|T1], [":" ++ H2|T2], Bindings) ->
+    match_path(T1, T2, case string:tokens(H2, ":") of
+                           [Type, Name] ->
+                               Bindings#{list_to_atom(Name) => parse_var(Type, H1)};
+                           [Name] ->
+                               Bindings#{list_to_atom(Name) => H1}
+                       end);
+match_path([H|T1], [H|T2], Bindings) ->
+    match_path(T1, T2, Bindings);
+match_path(_Path, _Pattern, _Bindings) ->
+    false.
 
-reply({StatusCode}, Req, _Handler) ->
-    cowboy_req:reply(StatusCode, Req);
+parse_params(Req) ->
+    QueryParams = cowboy_req:parse_qs(Req),
+    BodyParams = case cowboy_req:has_body(Req) of
+                     true  -> {_, Body, _} = cowboy_req:read_body(Req),
+                              json_decode(Body);
+                     false -> []
+                 end,
+    QueryParams ++ BodyParams.
 
-reply({StatusCode, Body0}, Req, Handler) ->
-    case minirest_body:encode(Body0) of
-        {ok, Headers, Body} ->
-            cowboy_req:reply(StatusCode, Headers, Body, Req);
-        {response, Response} ->
-            reply(Response, Req, Handler)
-    end;
+parse_var("atom", S) -> list_to_existing_atom(S);
+parse_var("int", S)  -> list_to_integer(S);
+parse_var("bin", S)  -> iolist_to_binary(S).
 
-reply({StatusCode, Headers, Body0}, Req, Handler) ->
-    case minirest_body:encode(Body0) of
-        {ok, Headers1, Body} ->
-            cowboy_req:reply(StatusCode, maps:merge(Headers1, Headers), Body, Req);
-        {response, Response} ->
-            reply(Response, Req, Handler)
-    end;
+jsonify(ok, Req) ->
+    jsonify(200, <<"ok">>, Req);
+jsonify({ok, Response}, Req) ->
+    jsonify(200, Response, Req);
+jsonify({ok, Headers, Response}, Req) ->
+    cowboy_req:reply(200, Headers, Response, Req);
+jsonify({error, Reason}, Req) ->
+    jsonify(500, Reason, Req);
+jsonify({Code, Response}, Req) when is_integer(Code) ->
+    jsonify(Code, Response, Req);
+jsonify({Code, Headers, Response}, Req) when is_integer(Code) ->
+    jsonify(Code, Headers, Response, Req).
 
-reply(BadReturn, Req, _Handler) ->
-    StatusCode = ?RESPONSE_CODE_INTERNAL_SERVER_ERROR,
-    Body = io_lib:format("mini rest bad return ~p", [BadReturn]),
-    cowboy_req:reply(StatusCode, #{<<"content-type">> => <<"text/plain">>}, Body, Req).
+jsonify(Code, Response, Req) ->
+    jsonify(Code, #{}, Response, Req).
+jsonify(Code, Headers, Response, Req) ->
+    try json_encode(Response) of
+        Json ->
+            cowboy_req:reply(Code, maps:merge(#{<<"content-type">> => <<"application/json">>}, Headers), Json, Req)
+    catch
+        error:Reason:_Stacktrace ->
+            ?LOG(error, "Encode ~p failed with ~p", [Response, Reason])
+    end.
 
-maybe_ignore_code_check(401, _Code) -> true;
-maybe_ignore_code_check(400, 'BAD_REQUEST') -> true;
-maybe_ignore_code_check(500, 'INTERNAL_ERROR') -> true;
-maybe_ignore_code_check(_, _) -> false.
+reply(Code, Text, Req) ->
+    cowboy_req:reply(Code, #{<<"content-type">> => <<"text/plain">>}, Text, Req).
+
+%% JSON
+json_encode(D) ->
+    to_binary(jiffy:encode(to_map(D), [force_utf8])).
+
+to_binary(B) when is_binary(B) -> B;
+to_binary(L) when is_list(L) ->
+    iolist_to_binary(L).
+
+json_decode(B) ->
+    from_ejson(jiffy:decode(B)).
+
+%% For compatible previous params format
+from_ejson([{_}|_] = L) ->
+    [from_ejson(E) || E <- L];
+from_ejson({[]}) ->
+    [{}];
+from_ejson({L}) ->
+    [{Name, from_ejson(Value)} || {Name, Value} <- L];
+from_ejson(T) -> T.
+
+%% [{a, b}]           => #{a => b}
+%% [[{a,b}], [{c,d}]] => [#{a => b}, #{c => d}]
+%%
+%% [{a, #{b => c}}]   => #{a => #{b => c}}
+%% #{a => [{b, c}]}   => #{a => #{b => c}}
+%% #{a => [{}]}       => #{a => #{}}
+
+to_map([{}]) ->
+    #{};
+to_map([[{_,_}|_]|_] = L) ->
+    [to_map(E) || E <- L];
+to_map([{_, _}|_] = L) ->
+    lists:foldl(
+      fun({Name, Value}, Acc) ->
+        Acc#{Name => to_map(Value)}
+      end, #{}, L);
+to_map([M|_] = L) when is_map(M) ->
+    [to_map(E) || E <- L];
+to_map(M) when is_map(M) ->
+    maps:map(fun(_, V) -> to_map(V) end, M);
+to_map(T) -> T.
+
+%%====================================================================
+%% EUnits
+%%====================================================================
+
+-ifdef(TEST).
+
+-include_lib("eunit/include/eunit.hrl").
+
+to_map_test() ->
+    #{a := b} = to_map([{a, b}]),
+    [#{a := b, c := d}, #{e := f}] = to_map([[{a, b}, {c, d}], [{e, f}]]),
+    #{a := #{b := c}} = to_map([{a, #{b => c}}]),
+    #{a := #{b := c}} = to_map(#{a => [{b, c}]}),
+    #{a := #{}} = to_map(#{a => [{}]}).
+
+-endif.

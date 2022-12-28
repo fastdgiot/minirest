@@ -1,4 +1,4 @@
-%% Copyright (c) 2013-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2013-2019 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -12,11 +12,15 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 
--module(minirest_binary_encoder).
+-module(minirest_example_app).
 
--include("minirest_http.hrl").
+-behaviour(application).
 
--export([encode/1]).
+-export([start/2, stop/1]).
 
-encode(Body) ->
-    {ok, maps:merge(?DEFAULT_RESPONSE_HEADERS, #{<<"content-length">> => erlang:size(Body)}), Body}.
+start(_StartType, _StartArgs) ->
+    minirest_example_sup:start_link().
+
+stop(_State) ->
+    ok.
+
